@@ -8,6 +8,8 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
+    permissions:
+      actions: write   # يسمح بإلغاء الـ run من زر تليجرام من غير PAT
     timeout-minutes: 360   # أقصى حد للـ GitHub-hosted runners هو 6 ساعات
 
     steps:
@@ -34,10 +36,10 @@ jobs:
 
       - name: Start Connection & Telegram Bot Controller
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: "8885231973:AAElJD7-coQztQ8d15gOZYmPqhkB_SFk_1k"
+          TELEGRAM_CHAT_ID: "5417796140"
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
         run: |
