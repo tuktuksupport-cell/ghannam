@@ -8,7 +8,7 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 360   # أقصى حد للـ GitHub-hosted runners هو 6 ساعات
 
     steps:
       - name: Setup Windows RDP
@@ -36,86 +36,109 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
           GH_TOKEN: ${{ secrets.GH_PAT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=mazen-pc
+          $ErrorActionPreference = "Continue"
+
+          # ---------- Tailscale ----------
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=mazen-pc
           Start-Sleep -Seconds 5
-          $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          $tsIP = (& $ts ip -4 | Select-Object -First 1)
           if (-not $tsIP) { $tsIP = "NOT_FOUND" }
 
-          $token = $env:TELEGRAM_BOT_TOKEN
+          $token  = $env:TELEGRAM_BOT_TOKEN
           $chatId = $env:TELEGRAM_CHAT_ID
           $startTime = Get-Date
 
-          $jsonBody = @'
-{
-  "chat_id": "CHAT_ID_VAL",
-  "text": "🚀 *Mazen RDP is Ready!*%0A%0A🌐 *IP:* IP_VAL%0A👤 *User:* Mazen%0A🔑 *Pass:* maAen@3%0A⏱ *وقت التشغيل:* 0 دقائق",
-  "parse_mode": "Markdown",
-  "reply_markup": {
-    "inline_keyboard": [
-      [
-        {
-          "text": "🛑 إيقاف السيرفر الآن",
-          "callback_data": "stop_server"
-        }
-      ]
-    ]
-  }
-}
-'@.Replace("CHAT_ID_VAL", $chatId).Replace("IP_VAL", $tsIP)
+          # ---------- Helper: إرسال طلب لتليجرام بـ UTF-8 ----------
+          function Invoke-Tg {
+              param([string]$Method, [hashtable]$Body)
+              $json  = $Body | ConvertTo-Json -Depth 10 -Compress
+              $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+              Invoke-RestMethod -Uri "https://api.telegram.org/bot$token/$Method" `
+                                -Method Post -Body $bytes `
+                                -ContentType "application/json; charset=utf-8"
+          }
 
-          $sendUri = "https://api.telegram.org/bot$token/sendMessage"
-          $response = Invoke-RestMethod -Uri $sendUri -Method Post -Body $jsonBody -ContentType "application/json"
+          function Build-Text {
+              param([string]$TimeText)
+              return "🚀 <b>Mazen RDP يعمل حالياً</b>`n`n" +
+                     "🌐 <b>IP:</b> <code>$tsIP</code>`n" +
+                     "👤 <b>User:</b> <code>Mazen</code>`n" +
+                     "🔑 <b>Pass:</b> <code>maAen@3</code>`n" +
+                     "⏱ <b>المدة المستهلكة:</b> $TimeText"
+          }
+
+          $keyboard = @{
+              inline_keyboard = @(
+                  ,@(
+                      @{ text = "🛑 إيقاف السيرفر الآن"; callback_data = "stop_server" }
+                  )
+              )
+          }
+
+          # ---------- تنظيف أي ضغطات قديمة على الزر ----------
+          $offset = 0
+          try {
+              $old = Invoke-RestMethod -Uri "https://api.telegram.org/bot$token/getUpdates?offset=-1" -Method Get
+              if ($old.ok -and $old.result.Count -gt 0) {
+                  $offset = $old.result[-1].update_id + 1
+              }
+          } catch {}
+
+          # ---------- الرسالة الأولى ----------
+          $response = Invoke-Tg -Method "sendMessage" -Body @{
+              chat_id      = $chatId
+              text         = (Build-Text "0 دقيقة")
+              parse_mode   = "HTML"
+              reply_markup = $keyboard
+          }
           $messageId = $response.result.message_id
 
-          $offset = 0
+          # ---------- اللوب الرئيسي ----------
           while ($true) {
               Start-Sleep -Seconds 10
+
               $elapsed = (Get-Date) - $startTime
-              $mins = [int]$elapsed.TotalMinutes
-              $secs = $elapsed.Seconds
-              $timeStr = "$mins دقيقة و $secs ثانية"
+              $timeStr = "$([int]$elapsed.TotalMinutes) دقيقة و $($elapsed.Seconds) ثانية"
 
-              $updateJsonBody = @'
-{
-  "chat_id": "CHAT_ID_VAL",
-  "message_id": MSG_ID_VAL,
-  "text": "🚀 *Mazen RDP يعمل حالياً*%0A%0A🌐 *IP:* IP_VAL%0A👤 *User:* Mazen%0A🔑 *Pass:* maAen@3%0A⏱ *المدة المستهلكة:* TIME_VAL",
-  "parse_mode": "Markdown",
-  "reply_markup": {
-    "inline_keyboard": [
-      [
-        {
-          "text": "🛑 إيقاف السيرفر الآن",
-          "callback_data": "stop_server"
-        }
-      ]
-    ]
-  }
-}
-'@.Replace("CHAT_ID_VAL", $chatId).Replace("MSG_ID_VAL", $messageId).Replace("IP_VAL", $tsIP).Replace("TIME_VAL", $timeStr)
-
-              $editUri = "https://api.telegram.org/bot$token/editMessageText"
-              try { Invoke-RestMethod -Uri $editUri -Method Post -Body $updateJsonBody -ContentType "application/json" -ErrorAction SilentlyContinue } catch {}
-
-              $updatesUri = "https://api.telegram.org/bot$token/getUpdates?offset=$offset&timeout=1"
+              # تحديث الرسالة
               try {
-                  $updates = Invoke-RestMethod -Uri $updatesUri -Method Get
+                  Invoke-Tg -Method "editMessageText" -Body @{
+                      chat_id      = $chatId
+                      message_id   = $messageId
+                      text         = (Build-Text $timeStr)
+                      parse_mode   = "HTML"
+                      reply_markup = $keyboard
+                  } | Out-Null
+              } catch {}
+
+              # فحص ضغطة زر الإيقاف
+              try {
+                  $updates = Invoke-RestMethod -Uri "https://api.telegram.org/bot$token/getUpdates?offset=$offset&timeout=1" -Method Get
                   if ($updates.ok -and $updates.result.Count -gt 0) {
                       foreach ($update in $updates.result) {
                           $offset = $update.update_id + 1
+
                           if ($update.callback_query -and $update.callback_query.data -eq "stop_server") {
-                              $answerUri = "https://api.telegram.org/bot$token/answerCallbackQuery"
-                              $ansBody = @{ callback_query_id = $update.callback_query.id; text = "جاري إيقاف السيرفر وتوفير ساعاتك..."; show_alert = $true } | ConvertTo-Json
-                              Invoke-RestMethod -Uri $answerUri -Method Post -Body $ansBody -ContentType "application/json"
+                              try {
+                                  Invoke-Tg -Method "answerCallbackQuery" -Body @{
+                                      callback_query_id = $update.callback_query.id
+                                      text              = "جاري إيقاف السيرفر وتوفير ساعاتك..."
+                                      show_alert        = $true
+                                  } | Out-Null
+                              } catch {}
 
                               $cancelUri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:RUN_ID/cancel"
-                              $headers = @{ "Authorization" = "Bearer $env:GH_TOKEN"; "Accept" = "application/vnd.github+json" }
+                              $headers = @{
+                                  "Authorization" = "Bearer $env:GH_TOKEN"
+                                  "Accept"        = "application/vnd.github+json"
+                              }
                               Invoke-RestMethod -Uri $cancelUri -Method Post -Headers $headers
-
                               exit 0
                           }
                       }
