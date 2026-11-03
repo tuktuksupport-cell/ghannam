@@ -44,17 +44,9 @@ jobs:
           RUN_ID: ${{ github.run_id }}
         run: |
           $ErrorActionPreference = "Continue"
-
-          # ---------- Tailscale ----------
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          & $ts up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=mazen-pc
-          Start-Sleep -Seconds 5
-          $tsIP = (& $ts ip -4 | Select-Object -First 1)
-          if (-not $tsIP) { $tsIP = "NOT_FOUND" }
-
           $token  = $env:TELEGRAM_BOT_TOKEN
           $chatId = $env:TELEGRAM_CHAT_ID
-          $startTime = Get-Date
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
           # ---------- Helper: إرسال طلب لتليجرام بـ UTF-8 ----------
           function Invoke-Tg {
@@ -65,6 +57,65 @@ jobs:
                                 -Method Post -Body $bytes `
                                 -ContentType "application/json; charset=utf-8"
           }
+
+          # قراءة ملف لسه البرنامج شغال عليه
+          function Read-Shared {
+              param([string]$Path)
+              try {
+                  $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+                  $sr = New-Object System.IO.StreamReader($fs)
+                  $t = $sr.ReadToEnd(); $sr.Close(); $fs.Close()
+                  return $t
+              } catch { return "" }
+          }
+
+          # ---------- Tailscale (لو محتاج تفعيل يبعت الرابط على البوت) ----------
+          $tsArgs = @("up", "--hostname=mazen-pc")
+          if ($env:TAILSCALE_AUTH_KEY) { $tsArgs += "--authkey=$env:TAILSCALE_AUTH_KEY" }
+
+          $outFile = Join-Path $env:TEMP "ts_out.txt"
+          $errFile = Join-Path $env:TEMP "ts_err.txt"
+          $proc = Start-Process -FilePath $ts -ArgumentList $tsArgs `
+                    -RedirectStandardOutput $outFile -RedirectStandardError $errFile `
+                    -PassThru -NoNewWindow
+
+          $linkSent = $false
+          $deadline = (Get-Date).AddMinutes(10)
+          while (-not $proc.HasExited -and (Get-Date) -lt $deadline) {
+              Start-Sleep -Seconds 2
+              if (-not $linkSent) {
+                  $content = (Read-Shared $outFile) + (Read-Shared $errFile)
+                  if ($content -match 'https://login\.tailscale\.com/a/[A-Za-z0-9]+') {
+                      $authUrl = $Matches[0]
+                      try {
+                          Invoke-Tg -Method "sendMessage" -Body @{
+                              chat_id      = $chatId
+                              text         = "🔐 Tailscale محتاج تفعيل. اضغط الزر وسجّل دخول، والسيرفر هيكمل لوحده."
+                              reply_markup = @{
+                                  inline_keyboard = @( ,@( @{ text = "🔐 تفعيل Tailscale"; url = $authUrl } ) )
+                              }
+                          } | Out-Null
+                      } catch {}
+                      $linkSent = $true
+                  }
+              }
+          }
+
+          if (-not $proc.HasExited) {
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+              try { Invoke-Tg -Method "sendMessage" -Body @{ chat_id = $chatId; text = "❌ انتهت مهلة تفعيل Tailscale (10 دقايق)." } | Out-Null } catch {}
+              exit 1
+          }
+          $proc.WaitForExit()
+          if ($proc.ExitCode -ne 0) {
+              try { Invoke-Tg -Method "sendMessage" -Body @{ chat_id = $chatId; text = "❌ فشل تشغيل Tailscale." } | Out-Null } catch {}
+              exit 1
+          }
+
+          Start-Sleep -Seconds 3
+          $tsIP = (& $ts ip -4 | Select-Object -First 1)
+          if (-not $tsIP) { $tsIP = "NOT_FOUND" }
+          $startTime = Get-Date
 
           function Build-Text {
               param([string]$TimeText)
@@ -102,13 +153,14 @@ jobs:
           $messageId = $response.result.message_id
 
           # ---------- اللوب الرئيسي ----------
+          # ملحوظة: لو فعّلت Webhook للبوت (Cloudflare Worker) فـ getUpdates بتفشل
+          # بهدوء، والـ Worker هو اللي بيتعامل مع زر الإيقاف.
           while ($true) {
               Start-Sleep -Seconds 10
 
               $elapsed = (Get-Date) - $startTime
               $timeStr = "$([int]$elapsed.TotalMinutes) دقيقة و $($elapsed.Seconds) ثانية"
 
-              # تحديث الرسالة
               try {
                   Invoke-Tg -Method "editMessageText" -Body @{
                       chat_id      = $chatId
@@ -119,7 +171,6 @@ jobs:
                   } | Out-Null
               } catch {}
 
-              # فحص ضغطة زر الإيقاف
               try {
                   $updates = Invoke-RestMethod -Uri "https://api.telegram.org/bot$token/getUpdates?offset=$offset&timeout=1" -Method Get
                   if ($updates.ok -and $updates.result.Count -gt 0) {
